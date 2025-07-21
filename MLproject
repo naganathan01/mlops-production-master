@@ -1,0 +1,18 @@
+# MLproject
+name: production-ml-model
+
+python_env: python_env.yaml
+
+entry_points:
+  main:
+    parameters:
+      data_path: {type: string, default: "data/sample_training_data.csv"}
+      experiment_name: {type: string, default: "production-model"}
+      model_name: {type: string, default: "production-model"}
+    command: "python src/model/train.py --data-path {data_path} --experiment-name {experiment_name} --model-name {model_name}"
+  
+  predict:
+    parameters:
+      model_uri: {type: string}
+      input_path: {type: string}
+    command: "python src/model/predict.py --model-uri {model_uri} --input-path {input_path}"
