@@ -1,0 +1,291 @@
+# .azure-pipelines/cd-pipeline.yml
+trigger: none
+
+pr: none
+
+resources:
+  pipelines:
+  - pipeline: ci-pipeline
+    source: 'ML-Model-CI'
+    trigger:
+      branches:
+      - main
+
+variables:
+- group: 'ml-deployment-vars'
+- name: vmImageName
+  value: 'ubuntu-latest'
+
+stages:
+- stage: DeployStaging
+  displayName: 'Deploy to Staging'
+  jobs:
+  - deployment: DeployToStaging
+    displayName: 'Deploy to Staging Environment'
+    pool:
+      vmImage: $(vmImageName)
+    environment: 'staging'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+          
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              buildType: 'specific'
+              project: $(System.TeamProjectId)
+              definition: $(resources.pipeline.ci-pipeline.pipelineID)
+              buildVersionToDownload: 'latest'
+              artifactName: 'model-evaluation-report'
+              targetPath: $(Pipeline.Workspace)
+          
+          - task: KubernetesManifest@0
+            displayName: 'Deploy to staging namespace'
+            inputs:
+              action: 'deploy'
+              kubernetesServiceConnection: 'k8s-staging'
+              namespace: 'ml-staging'
+              manifests: |
+                infrastructure/kubernetes/namespace.yaml
+                infrastructure/kubernetes/deployment.yaml
+                infrastructure/kubernetes/service.yaml
+                infrastructure/kubernetes/ingress.yaml
+              containers: 'mlregistry.azurecr.io/ml-model-api:$(resources.pipeline.ci-pipeline.runID)'
+          
+          - script: |
+              # Wait for deployment to be ready
+              kubectl wait --for=condition=available --timeout=300s deployment/ml-api -n ml-staging
+              
+              # Get service URL
+              STAGING_URL=$(kubectl get ingress ml-api-ingress -n ml-staging -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+              echo "Staging URL: http://$STAGING_URL"
+              
+              # Run smoke tests
+              python tests/integration/test_api_health.py --endpoint "http://$STAGING_URL" --max-retries 5
+            displayName: 'Staging smoke tests'
+
+- stage: PerformanceTest
+  displayName: 'Performance Testing'
+  dependsOn: DeployStaging
+  condition: succeeded()
+  jobs:
+  - job: LoadTest
+    displayName: 'Load Testing'
+    pool:
+      vmImage: $(vmImageName)
+    
+    steps:
+    - script: |
+        pip install locust
+      displayName: 'Install load testing tools'
+    
+    - script: |
+        # Get staging URL
+        STAGING_URL=$(kubectl get ingress ml-api-ingress -n ml-staging -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+        
+        # Run load tests
+        python tests/performance/load_test.py --host "http://$STAGING_URL" --users 50 --spawn-rate 5 --run-time 300
+      displayName: 'Run load tests'
+
+- stage: SecurityTest
+  displayName: 'Security Testing'
+  dependsOn: DeployStaging
+  condition: succeeded()
+  jobs:
+  - job: PenetrationTest
+    displayName: 'Security Penetration Testing'
+    pool:
+      vmImage: $(vmImageName)
+    
+    steps:
+    - script: |
+        # Install OWASP ZAP
+        docker pull owasp/zap2docker-stable
+        
+        # Get staging URL
+        STAGING_URL=$(kubectl get ingress ml-api-ingress -n ml-staging -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+        
+        # Run security scan
+        docker run -v $(pwd):/zap/wrk/:rw owasp/zap2docker-stable zap-baseline.py \
+          -t "http://$STAGING_URL" \
+          -J security_report.json \
+          -r security_report.html
+      displayName: 'Security penetration test'
+      continueOnError: true
+    
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathToPublish: 'security_report.html'
+        artifactName: 'security-test-report'
+
+- stage: ApprovalGate
+  displayName: 'Production Approval'
+  dependsOn: 
+  - PerformanceTest
+  - SecurityTest
+  condition: succeeded()
+  jobs:
+  - job: waitForValidation
+    displayName: 'Wait for manual validation'
+    pool: server
+    timeoutInMinutes: 4320 # 3 days
+    steps:
+    - task: ManualValidation@0
+      timeoutInMinutes: 4320
+      inputs:
+        notifyUsers: |
+          $(APPROVAL_USERS)
+        instructions: |
+          Please review the following before approving production deployment:
+          1. Model performance metrics
+          2. Load test results
+          3. Security scan results
+          4. Staging environment validation
+          
+          Approve only if all criteria are met for production deployment.
+
+- stage: DeployProduction
+  displayName: 'Deploy to Production'
+  dependsOn: ApprovalGate
+  condition: succeeded()
+  jobs:
+  - deployment: DeployToProduction
+    displayName: 'Deploy to Production Environment'
+    pool:
+      vmImage: $(vmImageName)
+    environment: 'production'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+          
+          - task: KubernetesManifest@0
+            displayName: 'Deploy to production namespace'
+            inputs:
+              action: 'deploy'
+              kubernetesServiceConnection: 'k8s-production'
+              namespace: 'ml-production'
+              manifests: |
+                infrastructure/kubernetes/namespace.yaml
+                infrastructure/kubernetes/deployment.yaml
+                infrastructure/kubernetes/service.yaml
+                infrastructure/kubernetes/ingress.yaml
+              containers: 'mlregistry.azurecr.io/ml-model-api:$(resources.pipeline.ci-pipeline.runID)'
+          
+          - script: |
+              # Wait for deployment
+              kubectl wait --for=condition=available --timeout=600s deployment/ml-api -n ml-production
+              
+              # Production smoke tests
+              PROD_URL=$(kubectl get ingress ml-api-ingress -n ml-production -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+              python tests/integration/test_api_health.py --endpoint "http://$PROD_URL" --max-retries 5
+              
+              echo "✅ Production deployment successful!"
+              echo "Production URL: http://$PROD_URL"
+            displayName: 'Production validation'
+
+- stage: PostDeployment
+  displayName: 'Post-Deployment Tasks'
+  dependsOn: DeployProduction
+  condition: succeeded()
+  jobs:
+  - job: ModelPromotion
+    displayName: 'Promote Model to Production'
+    pool:
+      vmImage: $(vmImageName)
+    
+    steps:
+    - script: |
+        pip install mlflow
+        
+        # Set MLflow tracking URI
+        export MLFLOW_TRACKING_URI=$(MLFLOW_TRACKING_URI)
+        
+        # Get the latest successful model run ID from artifacts
+        # This would typically come from the CI pipeline artifacts
+        RUN_ID=$(cat $(Pipeline.Workspace)/model-evaluation-report/evaluation_report.json | python -c "import sys, json; print(json.load(sys.stdin).get('run_id', ''))")
+        
+        if [ ! -z "$RUN_ID" ]; then
+          python src/utils/promote_model.py \
+            --run-id "$RUN_ID" \
+            --model-name "production-model" \
+            --stage "Production" \
+            --description "Promoted via CD pipeline on $(date)"
+          
+          echo "✅ Model promoted to Production stage"
+        else
+          echo "❌ No run ID found for model promotion"
+          exit 1
+        fi
+      displayName: 'Promote model to production'
+  
+  - job: NotifyTeams
+    displayName: 'Notify Teams'
+    pool:
+      vmImage: $(vmImageName)
+    
+    steps:
+    - script: |
+        # Send notification to teams (Slack, Email, etc.)
+        curl -X POST -H 'Content-type: application/json' \
+          --data '{"text":"🚀 ML Model successfully deployed to production!\nBuild: $(Build.BuildNumber)\nCommit: $(Build.SourceVersion)"}' \
+          $(SLACK_WEBHOOK_URL)
+      displayName: 'Send deployment notification'
+      condition: always()
+
+- stage: MonitoringSetup
+  displayName: 'Setup Monitoring'
+  dependsOn: DeployProduction
+  condition: succeeded()
+  jobs:
+  - job: SetupAlerts
+    displayName: 'Configure Monitoring and Alerts'
+    pool:
+      vmImage: $(vmImageName)
+    
+    steps:
+    - script: |
+        # Setup Prometheus alerts and Grafana dashboards
+        kubectl apply -f infrastructure/monitoring/prometheus-config.yaml -n ml-production
+        
+        # Configure alert rules
+        cat << EOF | kubectl apply -f -
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ml-alert-rules
+          namespace: ml-production
+        data:
+          alerts.yml: |
+            groups:
+            - name: ml-model-alerts
+              rules:
+              - alert: ModelPredictionLatencyHigh
+                expr: histogram_quantile(0.95, ml_prediction_latency_seconds) > 1.0
+                for: 5m
+                labels:
+                  severity: warning
+                annotations:
+                  summary: "High prediction latency detected"
+              
+              - alert: ModelAccuracyDrop
+                expr: ml_model_accuracy < 0.7
+                for: 10m
+                labels:
+                  severity: critical
+                annotations:
+                  summary: "Model accuracy below threshold"
+              
+              - alert: ModelDriftDetected
+                expr: ml_drift_score > 2.0
+                for: 15m
+                labels:
+                  severity: warning
+                annotations:
+                  summary: "Model drift detected"
+        EOF
+        
+        echo "✅ Monitoring and alerts configured"
+      displayName: 'Setup monitoring alerts'

@@ -1,0 +1,80 @@
+# infrastructure/kubernetes/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ml-api
+  namespace: ml-production
+  labels:
+    app: ml-api
+    version: v1
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: ml-api
+  template:
+    metadata:
+      labels:
+        app: ml-api
+        version: v1
+    spec:
+      containers:
+      - name: ml-api
+        image: mlregistry.azurecr.io/ml-model-api:latest
+        ports:
+        - containerPort: 8080
+          name: http
+        - containerPort: 9090
+          name: metrics
+        env:
+        - name: MLFLOW_TRACKING_URI
+          valueFrom:
+            configMapKeyRef:
+              name: ml-config
+              key: mlflow-uri
+        - name: MODEL_NAME
+          value: "production-model"
+        - name: MODEL_STAGE
+          value: "Production"
+        - name: LOG_LEVEL
+          value: "INFO"
+        - name: API_HOST
+          value: "0.0.0.0"
+        - name: API_PORT
+          value: "8080"
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        volumeMounts:
+        - name: model-cache
+          mountPath: /app/model-cache
+        - name: logs
+          mountPath: /app/logs
+      volumes:
+      - name: model-cache
+        emptyDir: {}
+      - name: logs
+        emptyDir: {}
+      imagePullSecrets:
+      - name: acr-secret
+

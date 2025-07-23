@@ -1,0 +1,305 @@
+# .azure-pipelines/ci-pipeline.yml
+trigger:
+  branches:
+    include:
+    - main
+    - develop
+  paths:
+    include:
+    - src/
+    - tests/
+    - requirements.txt
+    - Dockerfile
+
+variables:
+  pythonVersion: '3.9'
+  vmImageName: 'ubuntu-latest'
+
+stages:
+- stage: Test
+  displayName: 'Test and Quality Checks'
+  jobs:
+  - job: UnitTests
+    displayName: 'Unit Tests'
+    pool:
+      vmImage: $(vmImageName)
+    
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '$(pythonVersion)'
+      displayName: 'Use Python $(pythonVersion)'
+    
+    - script: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+      displayName: 'Install dependencies'
+    
+    - script: |
+        export PYTHONPATH="${PYTHONPATH}:$(pwd)"
+        python -m pytest tests/unit/ -v --junitxml=junit/test-results.xml --cov=src --cov-report=xml
+      displayName: 'Run unit tests'
+    
+    - task: PublishTestResults@2
+      condition: succeededOrFailed()
+      inputs:
+        testResultsFiles: '**/test-*.xml'
+        testRunTitle: 'Publish test results for Python $(pythonVersion)'
+    
+    - task: PublishCodeCoverageResults@1
+      inputs:
+        codeCoverageTool: Cobertura
+        summaryFileLocation: '$(System.DefaultWorkingDirectory)/**/coverage.xml'
+
+  - job: CodeQuality
+    displayName: 'Code Quality'
+    pool:
+      vmImage: $(vmImageName)
+    
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '$(pythonVersion)'
+      displayName: 'Use Python $(pythonVersion)'
+    
+    - script: |
+        python -m pip install --upgrade pip
+        pip install black flake8 isort mypy
+      displayName: 'Install linting tools'
+    
+    - script: |
+        black --check src/ tests/
+      displayName: 'Check code formatting'
+    
+    - script: |
+        isort --check-only src/ tests/
+      displayName: 'Check import sorting'
+    
+    - script: |
+        flake8 src/ tests/ --max-line-length=88 --extend-ignore=E203,W503
+      displayName: 'Run flake8 linting'
+
+  - job: DataValidation
+    displayName: 'Data Quality Validation'
+    pool:
+      vmImage: $(vmImageName)
+    
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '$(pythonVersion)'
+      displayName: 'Use Python $(pythonVersion)'
+    
+    - script: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+      displayName: 'Install dependencies'
+    
+    - script: |
+        export PYTHONPATH="${PYTHONPATH}:$(pwd)"
+        # Generate sample data for validation
+        python -c "
+        import pandas as pd
+        import numpy as np
+        np.random.seed(42)
+        n_samples = 1000
+        data = {}
+        for i in range(10):
+            data[f'feature_{i}'] = np.random.normal(0, 1, n_samples)
+        X = np.column_stack(list(data.values()))
+        target = (X[:, 0] + X[:, 1] > 0).astype(int)
+        data['target'] = target
+        df = pd.DataFrame(data)
+        df.to_csv('sample_data.csv', index=False)
+        "
+        python src/data/validate_data.py --data-path sample_data.csv --output validation_report.json
+      displayName: 'Validate data quality'
+    
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathToPublish: 'validation_report.json'
+        artifactName: 'data-validation-report'
+
+- stage: Build
+  displayName: 'Build and Package'
+  dependsOn: Test
+  condition: succeeded()
+  jobs:
+  - job: BuildDocker
+    displayName: 'Build Docker Image'
+    pool:
+      vmImage: $(vmImageName)
+    
+    steps:
+    - task: Docker@2
+      displayName: 'Build Docker image'
+      inputs:
+        containerRegistry: 'dockerRegistryConnection'
+        repository: 'ml-model-api'
+        command: 'build'
+        Dockerfile: 'Dockerfile'
+        tags: |
+          $(Build.BuildId)
+          latest
+    
+    - task: Docker@2
+      displayName: 'Push Docker image'
+      inputs:
+        containerRegistry: 'dockerRegistryConnection'
+        repository: 'ml-model-api'
+        command: 'push'
+        tags: |
+          $(Build.BuildId)
+          latest
+
+- stage: IntegrationTest
+  displayName: 'Integration Tests'
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - job: APITests
+    displayName: 'API Integration Tests'
+    pool:
+      vmImage: $(vmImageName)
+    
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '$(pythonVersion)'
+      displayName: 'Use Python $(pythonVersion)'
+    
+    - script: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+      displayName: 'Install dependencies'
+    
+    - script: |
+        # Start MLflow server
+        mlflow server --host 0.0.0.0 --port 5000 --default-artifact-root ./mlruns --backend-store-uri sqlite:///mlflow.db &
+        MLFLOW_PID=$!
+        sleep 10
+        
+        # Generate and train model
+        export PYTHONPATH="${PYTHONPATH}:$(pwd)"
+        python -c "
+        import pandas as pd
+        import numpy as np
+        np.random.seed(42)
+        n_samples = 1000
+        data = {}
+        for i in range(10):
+            data[f'feature_{i}'] = np.random.normal(0, 1, n_samples)
+        X = np.column_stack(list(data.values()))
+        target = (X[:, 0] + X[:, 1] > 0).astype(int)
+        data['target'] = target
+        df = pd.DataFrame(data)
+        df.to_csv('training_data.csv', index=False)
+        "
+        
+        # Train model
+        python src/model/train.py --data-path training_data.csv --experiment-name ci-test --model-name ci-test-model --no-tuning
+        
+        # Start API
+        export MODEL_NAME=ci-test-model
+        export MODEL_STAGE=None
+        python src/api/app.py &
+        API_PID=$!
+        sleep 15
+        
+        # Run integration tests
+        python tests/integration/test_api_health.py --endpoint http://localhost:8080 --max-retries 3
+        
+        # Cleanup
+        kill $MLFLOW_PID $API_PID
+      displayName: 'Run integration tests'
+
+- stage: SecurityScan
+  displayName: 'Security Scanning'
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - job: VulnerabilityScan
+    displayName: 'Vulnerability Scanning'
+    pool:
+      vmImage: $(vmImageName)
+    
+    steps:
+    - script: |
+        pip install safety bandit
+        safety check -r requirements.txt
+        bandit -r src/ -f json -o bandit_report.json
+      displayName: 'Security vulnerability scan'
+      continueOnError: true
+    
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathToPublish: 'bandit_report.json'
+        artifactName: 'security-scan-report'
+
+- stage: ModelValidation
+  displayName: 'Model Performance Validation'
+  dependsOn: IntegrationTest
+  condition: succeeded()
+  jobs:
+  - job: ModelQualityGate
+    displayName: 'Model Quality Gate'
+    pool:
+      vmImage: $(vmImageName)
+    
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '$(pythonVersion)'
+      displayName: 'Use Python $(pythonVersion)'
+    
+    - script: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+      displayName: 'Install dependencies'
+    
+    - script: |
+        export PYTHONPATH="${PYTHONPATH}:$(pwd)"
+        
+        # Start MLflow
+        mlflow server --host 0.0.0.0 --port 5000 --default-artifact-root ./mlruns --backend-store-uri sqlite:///mlflow.db &
+        sleep 10
+        
+        # Generate test data
+        python -c "
+        import pandas as pd
+        import numpy as np
+        np.random.seed(42)
+        n_samples = 500
+        data = {}
+        for i in range(10):
+            data[f'feature_{i}'] = np.random.normal(0, 1, n_samples)
+        X = np.column_stack(list(data.values()))
+        target = (X[:, 0] + X[:, 1] > 0).astype(int)
+        data['target'] = target
+        df = pd.DataFrame(data)
+        df.to_csv('test_data.csv', index=False)
+        df.to_csv('training_data.csv', index=False)
+        "
+        
+        # Train and evaluate model
+        python src/model/train.py --data-path training_data.csv --experiment-name quality-gate --model-name quality-gate-model --no-tuning
+        
+        # Get latest model URI and evaluate
+        python -c "
+        import mlflow
+        from mlflow.tracking import MlflowClient
+        client = MlflowClient()
+        latest_versions = client.get_latest_versions('quality-gate-model', stages=['None'])
+        if latest_versions:
+            model_uri = f'models:/quality-gate-model/{latest_versions[0].version}'
+            print(f'MODEL_URI={model_uri}')
+        " > model_uri.txt
+        
+        MODEL_URI=$(cat model_uri.txt | grep MODEL_URI | cut -d'=' -f2)
+        python src/model/evaluate.py --model-uri "$MODEL_URI" --test-data test_data.csv --output-report evaluation_report.json
+      displayName: 'Model quality gate validation'
+    
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathToPublish: 'evaluation_report.json'
+        artifactName: 'model-evaluation-report'
