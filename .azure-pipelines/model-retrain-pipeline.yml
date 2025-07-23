@@ -1,0 +1,400 @@
+# .azure-pipelines/model-retrain-pipeline.yml
+trigger: none
+
+schedules:
+- cron: "0 2 * * 0"  # Weekly at 2 AM on Sunday
+  displayName: Weekly model retraining
+  branches:
+    include:
+    - main
+  always: true
+
+parameters:
+- name: forceRetrain
+  displayName: Force retrain even if no new data
+  type: boolean
+  default: false
+
+variables:
+- group: 'ml-training-vars'
+- name: pythonVersion
+  value: '3.9'
+- name: vmImageName
+  value: 'ubuntu-latest'
+
+stages:
+- stage: DataValidation
+  displayName: 'Data Quality Check'
+  jobs:
+  - job: ValidateNewData
+    displayName: 'Validate New Training Data'
+    pool:
+      vmImage: $(vmImageName)
+    
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '$(pythonVersion)'
+      displayName: 'Use Python $(pythonVersion)'
+    
+    - script: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+      displayName: 'Install dependencies'
+    
+    - task: AzureKeyVault@2
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        KeyVaultName: '$(keyVaultName)'
+        SecretsFilter: '*'
+        RunAsPreJob: true
+    
+    - script: |
+        export PYTHONPATH="${PYTHONPATH}:$(pwd)"
+        
+        # Download latest training data from data lake
+        python -c "
+        import os
+        from azure.storage.blob import BlobServiceClient
+        
+        # Connect to Azure Blob Storage
+        connection_string = os.environ['AZURE_STORAGE_CONNECTION_STRING']
+        blob_service = BlobServiceClient.from_connection_string(connection_string)
+        
+        # Download latest training data
+        container_name = 'training-data'
+        blob_name = 'latest/training_data.csv'
+        
+        with open('new_training_data.csv', 'wb') as f:
+            blob_client = blob_service.get_blob_client(container=container_name, blob=blob_name)
+            f.write(blob_client.download_blob().readall())
+        
+        print('✅ Training data downloaded')
+        "
+        
+        # Validate data quality
+        python src/data/validate_data.py \
+          --data-path new_training_data.csv \
+          --output data_validation_report.json
+        
+        # Check if retraining is needed
+        python -c "
+        import json
+        import os
+        from datetime import datetime, timedelta
+        
+        # Load validation report
+        with open('data_validation_report.json', 'r') as f:
+            report = json.load(f)
+        
+        # Check data quality
+        data_quality_passed = report['data_quality']['passed']
+        
+        # Check if enough new data (example: need at least 1000 new samples)
+        new_samples = report['data_shape'][0]
+        sufficient_data = new_samples >= 1000
+        
+        # Check time since last training
+        force_retrain = '$(forceRetrain)'.lower() == 'true'
+        
+        should_retrain = data_quality_passed and (sufficient_data or force_retrain)
+        
+        print(f'Data quality passed: {data_quality_passed}')
+        print(f'Sufficient data: {sufficient_data} ({new_samples} samples)')
+        print(f'Force retrain: {force_retrain}')
+        print(f'Should retrain: {should_retrain}')
+        
+        # Set pipeline variable
+        print(f'##vso[task.setvariable variable=shouldRetrain;isOutput=true]{should_retrain}')
+        "
+      displayName: 'Validate new data and decide if retraining needed'
+      name: dataValidation
+    
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathToPublish: 'data_validation_report.json'
+        artifactName: 'retrain-data-validation'
+
+- stage: ModelRetraining
+  displayName: 'Model Retraining'
+  dependsOn: DataValidation
+  condition: eq(dependencies.DataValidation.outputs['ValidateNewData.dataValidation.shouldRetrain'], 'True')
+  jobs:
+  - job: TrainNewModel
+    displayName: 'Train New Model Version'
+    pool:
+      vmImage: $(vmImageName)
+    
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '$(pythonVersion)'
+      displayName: 'Use Python $(pythonVersion)'
+    
+    - script: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+      displayName: 'Install dependencies'
+    
+    - task: DownloadBuildArtifacts@1
+      inputs:
+        buildType: 'current'
+        artifactName: 'retrain-data-validation'
+        downloadPath: $(System.ArtifactsDirectory)
+    
+    - script: |
+        export PYTHONPATH="${PYTHONPATH}:$(pwd)"
+        export MLFLOW_TRACKING_URI=$(MLFLOW_TRACKING_URI)
+        
+        # Download training data again
+        python -c "
+        import os
+        from azure.storage.blob import BlobServiceClient
+        
+        connection_string = os.environ['AZURE_STORAGE_CONNECTION_STRING']
+        blob_service = BlobServiceClient.from_connection_string(connection_string)
+        container_name = 'training-data'
+        blob_name = 'latest/training_data.csv'
+        
+        with open('new_training_data.csv', 'wb') as f:
+            blob_client = blob_service.get_blob_client(container=container_name, blob=blob_name)
+            f.write(blob_client.download_blob().readall())
+        "
+        
+        # Train new model
+        python src/model/train.py \
+          --data-path new_training_data.csv \
+          --experiment-name "production-model-retrain" \
+          --model-name "production-model" \
+          > training_log.txt 2>&1
+        
+        # Extract run ID
+        RUN_ID=$(python -c "
+        import mlflow
+        from mlflow.tracking import MlflowClient
+        
+        mlflow.set_tracking_uri('$(MLFLOW_TRACKING_URI)')
+        client = MlflowClient()
+        
+        experiment = client.get_experiment_by_name('production-model-retrain')
+        if experiment:
+            runs = client.search_runs(experiment.experiment_id, order_by=['start_time DESC'], max_results=1)
+            if runs:
+                print(runs[0].info.run_id)
+        ")
+        
+        echo "New model run ID: $RUN_ID"
+        echo $RUN_ID > run_id.txt
+      displayName: 'Train new model'
+    
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathToPublish: 'run_id.txt'
+        artifactName: 'new-model-run-id'
+    
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathToPublish: 'training_log.txt'
+        artifactName: 'retrain-logs'
+
+- stage: ModelValidation
+  displayName: 'Validate New Model'
+  dependsOn: ModelRetraining
+  condition: succeeded()
+  jobs:
+  - job: ValidateModel
+    displayName: 'Validate Model Performance'
+    pool:
+      vmImage: $(vmImageName)
+    
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '$(pythonVersion)'
+      displayName: 'Use Python $(pythonVersion)'
+    
+    - script: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+      displayName: 'Install dependencies'
+    
+    - task: DownloadBuildArtifacts@1
+      inputs:
+        buildType: 'current'
+        artifactName: 'new-model-run-id'
+        downloadPath: $(System.ArtifactsDirectory)
+    
+    - script: |
+        export PYTHONPATH="${PYTHONPATH}:$(pwd)"
+        export MLFLOW_TRACKING_URI=$(MLFLOW_TRACKING_URI)
+        
+        # Get run ID
+        RUN_ID=$(cat $(System.ArtifactsDirectory)/new-model-run-id/run_id.txt)
+        echo "Evaluating model with run ID: $RUN_ID"
+        
+        # Download test data
+        python -c "
+        import os
+        from azure.storage.blob import BlobServiceClient
+        
+        connection_string = os.environ['AZURE_STORAGE_CONNECTION_STRING']
+        blob_service = BlobServiceClient.from_connection_string(connection_string)
+        container_name = 'training-data'
+        blob_name = 'test/test_data.csv'
+        
+        with open('test_data.csv', 'wb') as f:
+            blob_client = blob_service.get_blob_client(container=container_name, blob=blob_name)
+            f.write(blob_client.download_blob().readall())
+        "
+        
+        # Evaluate new model
+        python src/model/evaluate.py \
+          --model-uri "runs:/$RUN_ID/model" \
+          --test-data test_data.csv \
+          --baseline-metrics baseline_metrics.json \
+          --output-report new_model_evaluation.json
+        
+        # Check if model passes quality gates
+        python -c "
+        import json
+        
+        with open('new_model_evaluation.json', 'r') as f:
+            report = json.load(f)
+        
+        accuracy = report['metrics']['accuracy']
+        quality_gate_passed = accuracy > 0.75  # Stricter threshold for retraining
+        
+        print(f'New model accuracy: {accuracy:.3f}')
+        print(f'Quality gate passed: {quality_gate_passed}')
+        
+        # Compare with baseline if available
+        if 'improvements' in report:
+            accuracy_improvement = report['improvements'].get('accuracy', 0)
+            print(f'Accuracy improvement: {accuracy_improvement:.2f}%')
+            
+            # Only promote if significant improvement
+            significant_improvement = accuracy_improvement > 1.0  # At least 1% improvement
+            print(f'Significant improvement: {significant_improvement}')
+            
+            should_promote = quality_gate_passed and significant_improvement
+        else:
+            should_promote = quality_gate_passed
+        
+        print(f'Should promote: {should_promote}')
+        print(f'##vso[task.setvariable variable=shouldPromote;isOutput=true]{should_promote}')
+        "
+      displayName: 'Evaluate new model'
+      name: modelValidation
+    
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathToPublish: 'new_model_evaluation.json'
+        artifactName: 'new-model-evaluation'
+
+- stage: ModelPromotion
+  displayName: 'Promote New Model'
+  dependsOn: ModelValidation
+  condition: eq(dependencies.ModelValidation.outputs['ValidateModel.modelValidation.shouldPromote'], 'True')
+  jobs:
+  - job: PromoteModel
+    displayName: 'Promote Model to Staging'
+    pool:
+      vmImage: $(vmImageName)
+    
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '$(pythonVersion)'
+      displayName: 'Use Python $(pythonVersion)'
+    
+    - script: |
+        python -m pip install --upgrade pip
+        pip install mlflow
+      displayName: 'Install MLflow'
+    
+    - task: DownloadBuildArtifacts@1
+      inputs:
+        buildType: 'current'
+        artifactName: 'new-model-run-id'
+        downloadPath: $(System.ArtifactsDirectory)
+    
+    - script: |
+        export MLFLOW_TRACKING_URI=$(MLFLOW_TRACKING_URI)
+        
+        RUN_ID=$(cat $(System.ArtifactsDirectory)/new-model-run-id/run_id.txt)
+        
+        # Promote to Staging first
+        python src/utils/promote_model.py \
+          --run-id $RUN_ID \
+          --model-name "production-model" \
+          --stage "Staging" \
+          --description "Automatic retrain promotion - $(Build.BuildNumber)"
+        
+        echo "✅ Model promoted to Staging"
+        echo "🔄 Manual approval required for Production deployment"
+      displayName: 'Promote model to Staging'
+  
+  - job: NotifyTeam
+    displayName: 'Notify Team of New Model'
+    dependsOn: PromoteModel
+    pool:
+      vmImage: $(vmImageName)
+    
+    steps:
+    - script: |
+        # Send notification about new model ready for production
+        curl -X POST -H 'Content-type: application/json' \
+          --data '{
+            "text": "🤖 New ML model available for production deployment!\n📊 Build: $(Build.BuildNumber)\n🔗 Review: $(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)\n⚡ Action needed: Manual approval for production deployment"
+          }' \
+          $(SLACK_WEBHOOK_URL)
+      displayName: 'Send team notification'
+      condition: always()
+
+- stage: UpdateBaseline
+  displayName: 'Update Baseline Metrics'
+  dependsOn: ModelPromotion
+  condition: succeeded()
+  jobs:
+  - job: UpdateBaseline
+    displayName: 'Update Baseline Performance Metrics'
+    pool:
+      vmImage: $(vmImageName)
+    
+    steps:
+    - task: DownloadBuildArtifacts@1
+      inputs:
+        buildType: 'current'
+        artifactName: 'new-model-evaluation'
+        downloadPath: $(System.ArtifactsDirectory)
+    
+    - script: |
+        # Update baseline metrics for future comparisons
+        python -c "
+        import json
+        import os
+        from azure.storage.blob import BlobServiceClient
+        
+        # Load new model metrics
+        with open('$(System.ArtifactsDirectory)/new-model-evaluation/new_model_evaluation.json', 'r') as f:
+            evaluation = json.load(f)
+        
+        baseline_metrics = evaluation['metrics']
+        
+        # Save to blob storage
+        connection_string = os.environ['AZURE_STORAGE_CONNECTION_STRING']
+        blob_service = BlobServiceClient.from_connection_string(connection_string)
+        
+        blob_client = blob_service.get_blob_client(
+            container='model-artifacts', 
+            blob='baseline/baseline_metrics.json'
+        )
+        
+        blob_client.upload_blob(
+            json.dumps(baseline_metrics, indent=2),
+            overwrite=True
+        )
+        
+        print('✅ Baseline metrics updated')
+        "
+      displayName: 'Update baseline metrics'
